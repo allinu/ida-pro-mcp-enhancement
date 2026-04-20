@@ -163,7 +163,7 @@ stateDiagram-v2
     已连接 --> 首次写入: 守护线程检测 auto_is_ok() + hex-rays 初始化完成
     首次写入 --> 写入中: status=building
     写入中 --> 就绪: 全量写入完成 status=ready
-    就绪 --> 写入中: refresh_cache 触发 / IDA 再次 idle
+    就绪 --> 写入中: IDB 保存 / refresh_cache 触发 / 30 分钟兜底轮询
     写入中 --> 错误: 采集或写入异常
     错误 --> 写入中: 下一次 idle 自动重试
     就绪 --> [*]: IDA 关闭 / 断开
@@ -174,6 +174,10 @@ stateDiagram-v2
 - `meta` 表记录 `status`（`building / ready`）、`last_updated` 等。
 - 使用 WAL 模式，允许写入进行中仍被只读 `file:...?mode=ro` 连接查询（读到旧快照）。
 - `cache_status` 查询不抛错：文件缺失时返回 `{exists: false, status: "missing"}`。
+- **重新索引触发时机**（三种，任一满足即触发，触发后等待 IDA idle 再执行全量重建）：
+  1. **IDB 保存**：IDA 每次保存数据库（Ctrl+S 或自动保存）时，`IDB_Hooks.savebase` 回调立即唤醒守护线程，确保重命名、新增函数等变更实时同步。
+  2. **主动调用 `refresh_cache`**：MCP 客户端显式触发，绕过所有检查直接重建。
+  3. **30 分钟兜底轮询**：定时唤醒时检查 IDB 文件 mtime，若与上次重建时一致则跳过，避免无意义的全量扫描。
 
 ---
 

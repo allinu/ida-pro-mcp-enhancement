@@ -336,7 +336,7 @@ def _write_data_to_db(db_path: str, data: dict) -> CacheStats:
 # ============================================================================
 
 
-REFRESH_INTERVAL_SEC = 5 * 60  # 5 分钟
+REFRESH_INTERVAL_SEC = 30 * 60  # 30 分钟兜底轮询
 IDLE_POLL_SEC = 2.0  # 未就绪时的快速探测节奏
 
 
@@ -349,6 +349,8 @@ class _DaemonHandle:
     force_event: threading.Event
     last_stats: Optional[CacheStats] = None
     last_error: Optional[str] = None
+    last_idb_mtime: float = 0.0
+    idb_hook: Optional[object] = None
 
 
 _daemons: dict[str, _DaemonHandle] = {}
@@ -386,6 +388,10 @@ def _run_build_once(handle: _DaemonHandle) -> None:
         stats = _write_data_to_db(handle.db_path, data)
         handle.last_stats = stats
         handle.last_error = None
+        try:
+            handle.last_idb_mtime = os.path.getmtime(handle.idb_path)
+        except OSError:
+            pass
         print(
             f"[MCP][cache] 写入完成 {handle.db_path}: "
             f"strings={stats.strings} ({stats.string_xrefs} xrefs), "
@@ -426,13 +432,21 @@ def _daemon_loop(handle: _DaemonHandle) -> None:
             break
         handle.stop_event.wait(IDLE_POLL_SEC)
 
-    # 2. 周期性 / 被动刷新
+    # 2. 周期性 / 被动刷新（mtime 驱动：IDB 未变化则跳过重建）
     while not handle.stop_event.is_set():
         triggered = handle.force_event.wait(REFRESH_INTERVAL_SEC)
         if handle.stop_event.is_set():
             break
         handle.force_event.clear()
-        # 无论是定时触发还是主动 force 触发，都必须等 IDA 空闲
+        # 非 force 触发时，检查 IDB mtime，无变化则跳过
+        if not triggered:
+            try:
+                mtime = os.path.getmtime(handle.idb_path)
+            except OSError:
+                mtime = 0.0
+            if mtime == handle.last_idb_mtime:
+                print(f"[MCP][cache] IDB 未变化，跳过重建: {handle.idb_path}", file=sys.stderr)
+                continue
         while not handle.stop_event.is_set():
             try:
                 idle = _execute_in_ida_main(_ida_is_idle)
@@ -461,6 +475,20 @@ def _ensure_meta_building(db_path: str) -> None:
                 set_meta(conn, "schema_version", str(SCHEMA_VERSION))
     finally:
         conn.close()
+
+
+def _make_idb_save_hook(handle: _DaemonHandle):
+    """在 IDA 主线程中创建并注册 IDB_Hooks 子类实例。"""
+    import ida_idp
+
+    class _Hook(ida_idp.IDB_Hooks):
+        def savebase(self):
+            handle.force_event.set()
+            return 0
+
+    h = _Hook()
+    h.hook()
+    return h
 
 
 def start_cache_daemon(idb_path: str) -> Optional[str]:
@@ -494,6 +522,10 @@ def start_cache_daemon(idb_path: str) -> Optional[str]:
             daemon=True,
         )
         handle.thread = thread
+        try:
+            handle.idb_hook = _make_idb_save_hook(handle)
+        except Exception as e:
+            print(f"[MCP][cache] IDB_Hooks 注册失败: {e}", file=sys.stderr)
         _daemons[idb_path] = handle
         thread.start()
 
