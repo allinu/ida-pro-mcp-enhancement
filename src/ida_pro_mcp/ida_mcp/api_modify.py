@@ -1,3 +1,5 @@
+from typing import Annotated, Any, NotRequired, TypedDict
+
 import idaapi
 import idautils
 import idc
@@ -16,6 +18,7 @@ from .utils import (
     decompile_checked,
     refresh_decompiler_ctext,
     CommentOp,
+    CommentAppendOp,
     AsmPatchOp,
     FunctionRename,
     GlobalRename,
@@ -27,6 +30,66 @@ from .utils import (
 )
 
 
+class CommentResult(TypedDict):
+    addr: str
+    error: NotRequired[str]
+
+
+class AppendCommentResult(TypedDict):
+    addr: str
+    scope: NotRequired[str]
+    appended: NotRequired[bool]
+    skipped: NotRequired[bool]
+    error: NotRequired[str]
+
+
+class PatchAsmResult(TypedDict):
+    addr: str
+    error: NotRequired[str]
+
+
+class RenameItemResult(TypedDict, total=False):
+    addr: str
+    func_addr: str
+    old: str
+    new: str | None
+    name: str
+    dir: str
+    dir_error: str
+    dry_run: bool
+    error: str
+
+
+class RenameSummaryResult(TypedDict, total=False):
+    total: int
+    ok: int
+    failed: int
+    stopped: bool
+    dry_run: bool
+    allow_overwrite: bool
+    stop_on_error: bool
+    stopped_at: str
+
+
+class RenameResult(TypedDict, total=False):
+    func: list[RenameItemResult]
+    data: list[RenameItemResult]
+    global_alias: list[RenameItemResult]
+    local: list[RenameItemResult]
+    stack: list[RenameItemResult]
+    summary: RenameSummaryResult
+
+
+class DefineResult(TypedDict, total=False):
+    addr: str
+    ea: str
+    start: str
+    end: str
+    size: int
+    length: int
+    error: str
+
+
 # ============================================================================
 # Modification Operations
 # ============================================================================
@@ -34,7 +97,7 @@ from .utils import (
 
 @tool
 @idasync
-def set_comments(items: list[CommentOp] | CommentOp):
+def set_comments(items: list[CommentOp] | CommentOp) -> list[CommentResult]:
     """Set comments at addresses (both disassembly and decompiler views)"""
     if isinstance(items, dict):
         items = [items]
@@ -57,19 +120,19 @@ def set_comments(items: list[CommentOp] | CommentOp):
                 continue
 
             if not ida_hexrays.init_hexrays_plugin():
-                results.append({"addr": addr_str, "ok": True})
+                results.append({"addr": addr_str})
                 continue
 
             try:
                 cfunc = decompile_checked(ea)
             except IDAError:
-                results.append({"addr": addr_str, "ok": True})
+                results.append({"addr": addr_str})
                 continue
 
             if ea == cfunc.entry_ea:
                 idc.set_func_cmt(ea, comment, True)
                 cfunc.refresh_func_ctext()
-                results.append({"addr": addr_str, "ok": True})
+                results.append({"addr": addr_str})
                 continue
 
             eamap = cfunc.get_eamap()
@@ -77,7 +140,6 @@ def set_comments(items: list[CommentOp] | CommentOp):
                 results.append(
                     {
                         "addr": addr_str,
-                        "ok": True,
                         "error": f"Failed to set decompiler comment at {hex(ea)}",
                     }
                 )
@@ -96,7 +158,7 @@ def set_comments(items: list[CommentOp] | CommentOp):
                 cfunc.save_user_cmts()
                 cfunc.refresh_func_ctext()
                 if not cfunc.has_orphan_cmts():
-                    results.append({"addr": addr_str, "ok": True})
+                    results.append({"addr": addr_str})
                     break
                 cfunc.del_orphan_cmts()
                 cfunc.save_user_cmts()
@@ -104,7 +166,6 @@ def set_comments(items: list[CommentOp] | CommentOp):
                 results.append(
                     {
                         "addr": addr_str,
-                        "ok": True,
                         "error": f"Failed to set decompiler comment at {hex(ea)}",
                     }
                 )
@@ -116,7 +177,89 @@ def set_comments(items: list[CommentOp] | CommentOp):
 
 @tool
 @idasync
-def patch_asm(items: list[AsmPatchOp] | AsmPatchOp) -> list[dict]:
+def append_comments(
+    items: list[CommentAppendOp] | CommentAppendOp,
+) -> list[AppendCommentResult]:
+    """Append comments at addresses, deduping exact text by default."""
+    if isinstance(items, dict):
+        items = [items]
+
+    results = []
+    for item in items:
+        addr_str = item.get("addr", "")
+        comment = item.get("comment", "")
+        scope = str(item.get("scope", "auto") or "auto").lower()
+        dedupe = bool(item.get("dedupe", True))
+
+        try:
+            ea = parse_address(addr_str)
+            if scope not in {"auto", "func", "line"}:
+                results.append({"addr": addr_str, "error": f"Unsupported scope: {scope}"})
+                continue
+
+            fn = idaapi.get_func(ea)
+            use_func_comment = scope == "func" or (
+                scope == "auto" and fn is not None and fn.start_ea == ea
+            )
+
+            if use_func_comment:
+                if fn is None:
+                    results.append({"addr": addr_str, "error": f"No function found at {hex(ea)}"})
+                    continue
+                target_ea = fn.start_ea
+                current = idc.get_func_cmt(target_ea, False) or ""
+                new_comment, skipped = _append_comment_text(current, comment, dedupe=dedupe)
+                if skipped:
+                    results.append({"addr": addr_str, "scope": "func", "skipped": True})
+                    continue
+                if not idc.set_func_cmt(target_ea, new_comment, False):
+                    results.append(
+                        {
+                            "addr": addr_str,
+                            "error": f"Failed to set function comment at {hex(target_ea)}",
+                        }
+                    )
+                    continue
+                results.append({"addr": addr_str, "scope": "func", "appended": True})
+                continue
+
+            current = idaapi.get_cmt(ea, False) or ""
+            new_comment, skipped = _append_comment_text(current, comment, dedupe=dedupe)
+            if skipped:
+                results.append({"addr": addr_str, "scope": "line", "skipped": True})
+                continue
+            if not idaapi.set_cmt(ea, new_comment, False):
+                results.append(
+                    {
+                        "addr": addr_str,
+                        "error": f"Failed to set disassembly comment at {hex(ea)}",
+                    }
+                )
+                continue
+            results.append({"addr": addr_str, "scope": "line", "appended": True})
+        except Exception as e:
+            results.append({"addr": addr_str, "error": str(e)})
+
+    return results
+
+
+def _append_comment_text(current: str, new_text: str, *, dedupe: bool) -> tuple[str, bool]:
+    normalized_new = new_text.strip()
+    if dedupe and normalized_new:
+        existing_entries = [line.strip() for line in current.splitlines()]
+        if normalized_new in existing_entries:
+            return current, True
+    if not current:
+        return new_text, False
+    if not new_text:
+        return current, False
+    joiner = "" if current.endswith("\n") else "\n"
+    return f"{current}{joiner}{new_text}", False
+
+
+@tool
+@idasync
+def patch_asm(items: list[AsmPatchOp] | AsmPatchOp) -> list[PatchAsmResult]:
     """Patch assembly instructions at addresses"""
     if isinstance(items, dict):
         items = [items]
@@ -149,7 +292,7 @@ def patch_asm(items: list[AsmPatchOp] | AsmPatchOp) -> list[dict]:
                     )
                     break
             else:
-                results.append({"addr": addr_str, "ok": True})
+                results.append({"addr": addr_str})
         except Exception as e:
             results.append({"addr": addr_str, "error": str(e)})
 
@@ -158,14 +301,26 @@ def patch_asm(items: list[AsmPatchOp] | AsmPatchOp) -> list[dict]:
 
 @tool
 @idasync
-def rename(batch: RenameBatch) -> dict:
-    """批量重命名: 函数、全局变量、局部变量、栈变量。batch 可为空{}。格式: {func:[{addr,name}], data:[{old,new}], ...}"""
+def rename(
+    batch: Annotated[
+        RenameBatch,
+        "批量重命名: 函数、全局变量、局部变量、栈变量。batch 可为空{}。格式: {func:[{addr,name}], data:[{old,new}], ...}",
+    ],
+) -> RenameResult:
+    """批量重命名: 函数、全局变量、局部变量、栈变量。支持 dry_run 等选项。"""
+
+    stop_on_error = bool(batch.get("stop_on_error", False))
+    dry_run = bool(batch.get("dry_run", False))
+    allow_overwrite = bool(batch.get("allow_overwrite", False))
 
     def _normalize_items(items):
-        """Convert single item or None to list"""
         if items is None:
             return []
-        return [items] if isinstance(items, dict) else items
+        if isinstance(items, dict):
+            return [items]
+        if isinstance(items, list):
+            return [item for item in items if isinstance(item, dict)]
+        return []
 
     def _has_user_name(ea: int) -> bool:
         flags = idaapi.get_flags(ea)
@@ -182,11 +337,33 @@ def rename(batch: RenameBatch) -> dict:
             pass
         return False
 
+    def _set_name_checked(ea: int, new_name: str) -> tuple[bool, str | None]:
+        conflict_ea = idaapi.get_name_ea(idaapi.BADADDR, new_name)
+        if (
+            conflict_ea != idaapi.BADADDR
+            and conflict_ea != ea
+            and not allow_overwrite
+        ):
+            return False, f"Name already exists at {hex(conflict_ea)}"
+
+        if dry_run:
+            return True, None
+
+        flags = idaapi.SN_CHECK
+        if allow_overwrite:
+            flags = idaapi.SN_CHECK | int(getattr(idaapi, "SN_FORCE", 0))
+        ok = idaapi.set_name(ea, new_name, flags)
+        if not ok:
+            return False, "Rename failed"
+        return True, None
+
     def _place_func_in_vibe_dir(ea: int) -> tuple[bool, str | None]:
+        if dry_run:
+            return True, None
+
         tree = ida_dirtree.get_std_dirtree(ida_dirtree.DIRTREE_FUNCS)
         if tree is None:
             return False, "Function dirtree not available"
-
         if not tree.load():
             return False, "Failed to load function dirtree"
 
@@ -211,201 +388,402 @@ def rename(batch: RenameBatch) -> dict:
 
         return True, None
 
-    def _rename_funcs(items: list[FunctionRename]) -> list[dict]:
-        results = []
+    def _rename_funcs(items: list[FunctionRename]) -> tuple[list[dict], bool]:
+        results: list[dict] = []
+        halted = False
         for item in items:
             try:
-                ea = parse_address(item["addr"])
-                had_user_name = _has_user_name(ea)
-                success = idaapi.set_name(ea, item["name"], idaapi.SN_CHECK)
-                if success:
-                    func = idaapi.get_func(ea)
-                    if func:
-                        refresh_decompiler_ctext(func.start_ea)
-                    if not had_user_name and func:
-                        placed, place_error = _place_func_in_vibe_dir(func.start_ea)
-                    else:
-                        placed, place_error = None, None
-                results.append(
-                    {
-                        "addr": item["addr"],
-                        "name": item["name"],
-                        "ok": success,
-                        "error": None if success else "Rename failed",
-                        "dir": "vibe" if success and placed else None,
-                        "dir_error": place_error if success else None,
+                addr_text = item.get("addr") or item.get("func_addr") or item.get("func")
+                new_name = item.get("name") or item.get("new") or item.get("new_name")
+                if not addr_text or not new_name:
+                    result = {
+                        "addr": addr_text,
+                        "name": new_name,
+                        "error": "Function rename requires addr + name",
                     }
-                )
+                    results.append(result)
+                    if stop_on_error:
+                        halted = True
+                        break
+                    continue
+
+                ea = parse_address(addr_text)
+                func = idaapi.get_func(ea)
+                if not func:
+                    result = {
+                        "addr": addr_text,
+                        "name": new_name,
+                        "error": "Function not found",
+                    }
+                    results.append(result)
+                    if stop_on_error:
+                        halted = True
+                        break
+                    continue
+
+                old_name = idaapi.get_name(func.start_ea) or None
+                had_user_name = _has_user_name(func.start_ea)
+                success, error = _set_name_checked(func.start_ea, str(new_name))
+
+                placed, place_error = None, None
+                if success and not had_user_name:
+                    placed, place_error = _place_func_in_vibe_dir(func.start_ea)
+                if success and not dry_run:
+                    refresh_decompiler_ctext(func.start_ea)
+
+                result = {
+                    "addr": addr_text,
+                    "old": old_name,
+                    "name": str(new_name),
+                }
+                if error:
+                    result["error"] = error
+                if success and placed:
+                    result["dir"] = "vibe"
+                if place_error and success:
+                    result["dir_error"] = place_error
+                if dry_run:
+                    result["dry_run"] = True
+                results.append(result)
+                if not success and stop_on_error:
+                    halted = True
+                    break
             except Exception as e:
                 results.append({"addr": item.get("addr"), "error": str(e)})
-        return results
+                if stop_on_error:
+                    halted = True
+                    break
+        return results, halted
 
-    def _rename_globals(items: list[GlobalRename]) -> list[dict]:
-        results = []
+    def _rename_globals(items: list[GlobalRename]) -> tuple[list[dict], bool]:
+        results: list[dict] = []
+        halted = False
         for item in items:
             try:
-                ea = idaapi.get_name_ea(idaapi.BADADDR, item["old"])
-                if ea == idaapi.BADADDR:
-                    results.append(
-                        {
-                            "old": item["old"],
-                            "new": item["new"],
-                            "ok": False,
-                            "error": f"Global '{item['old']}' not found",
-                        }
-                    )
-                    continue
-                success = idaapi.set_name(ea, item["new"], idaapi.SN_CHECK)
-                results.append(
-                    {
-                        "old": item["old"],
-                        "new": item["new"],
-                        "ok": success,
-                        "error": None if success else "Rename failed",
+                addr_text = item.get("addr")
+                old_name = item.get("old") or item.get("old_name")
+                new_name = item.get("new") or item.get("new_name")
+
+                # Backward-compatible forms:
+                # 1) {addr, name} => rename by address
+                # 2) {name, new_name} => old=name, new=new_name
+                if new_name is None and addr_text is not None and item.get("name"):
+                    new_name = item.get("name")
+                if old_name is None and new_name is not None and item.get("name") and not addr_text:
+                    old_name = item.get("name")
+
+                if not new_name:
+                    result = {
+                        "old": old_name,
+                        "new": None,
+                        "error": "Global rename requires target and new name",
                     }
-                )
+                    results.append(result)
+                    if stop_on_error:
+                        halted = True
+                        break
+                    continue
+
+                ea = idaapi.BADADDR
+                if addr_text:
+                    ea = parse_address(str(addr_text))
+                    old_name = old_name or (idaapi.get_name(ea) or None)
+                elif old_name:
+                    ea = idaapi.get_name_ea(idaapi.BADADDR, str(old_name))
+
+                if ea == idaapi.BADADDR:
+                    result = {
+                        "old": old_name,
+                        "new": str(new_name),
+                        "error": f"Global '{old_name}' not found",
+                    }
+                    results.append(result)
+                    if stop_on_error:
+                        halted = True
+                        break
+                    continue
+
+                success, error = _set_name_checked(ea, str(new_name))
+                result = {
+                    "addr": hex(ea),
+                    "old": old_name,
+                    "new": str(new_name),
+                }
+                if error:
+                    result["error"] = error
+                if dry_run:
+                    result["dry_run"] = True
+                results.append(result)
+                if not success and stop_on_error:
+                    halted = True
+                    break
             except Exception as e:
                 results.append({"old": item.get("old"), "error": str(e)})
-        return results
+                if stop_on_error:
+                    halted = True
+                    break
+        return results, halted
 
-    def _rename_locals(items: list[LocalRename]) -> list[dict]:
-        results = []
+    def _rename_locals(items: list[LocalRename]) -> tuple[list[dict], bool]:
+        results: list[dict] = []
+        halted = False
         for item in items:
             try:
-                func = idaapi.get_func(parse_address(item["func_addr"]))
-                if not func:
-                    results.append(
-                        {
-                            "func_addr": item["func_addr"],
-                            "old": item["old"],
-                            "new": item["new"],
-                            "ok": False,
-                            "error": "No function found",
-                        }
-                    )
-                    continue
-                success = ida_hexrays.rename_lvar(
-                    func.start_ea, item["old"], item["new"]
-                )
-                if success:
-                    refresh_decompiler_ctext(func.start_ea)
-                results.append(
-                    {
-                        "func_addr": item["func_addr"],
-                        "old": item["old"],
-                        "new": item["new"],
-                        "ok": success,
-                        "error": None if success else "Rename failed",
+                func_addr = item.get("func_addr") or item.get("func")
+                old_name = item.get("old") or item.get("name")
+                new_name = item.get("new") or item.get("new_name")
+                if not func_addr or not old_name or not new_name:
+                    result = {
+                        "func_addr": func_addr,
+                        "old": old_name,
+                        "new": new_name,
+                        "error": "Local rename requires func_addr + old + new",
                     }
-                )
+                    results.append(result)
+                    if stop_on_error:
+                        halted = True
+                        break
+                    continue
+
+                func = idaapi.get_func(parse_address(func_addr))
+                if not func:
+                    result = {
+                        "func_addr": func_addr,
+                        "old": old_name,
+                        "new": new_name,
+                        "error": "No function found",
+                    }
+                    results.append(result)
+                    if stop_on_error:
+                        halted = True
+                        break
+                    continue
+
+                success = True
+                error = None
+                if not dry_run:
+                    success = ida_hexrays.rename_lvar(func.start_ea, old_name, new_name)
+                    if success:
+                        refresh_decompiler_ctext(func.start_ea)
+                if not success:
+                    error = "Rename failed"
+
+                result = {
+                    "func_addr": func_addr,
+                    "old": old_name,
+                    "new": new_name,
+                }
+                if error:
+                    result["error"] = error
+                if dry_run:
+                    result["dry_run"] = True
+                results.append(result)
+                if not success and stop_on_error:
+                    halted = True
+                    break
             except Exception as e:
                 results.append({"func_addr": item.get("func_addr"), "error": str(e)})
-        return results
+                if stop_on_error:
+                    halted = True
+                    break
+        return results, halted
 
-    def _rename_stack(items: list[StackRename]) -> list[dict]:
-        results = []
+    def _rename_stack(items: list[StackRename]) -> tuple[list[dict], bool]:
+        results: list[dict] = []
+        halted = False
         for item in items:
             try:
-                func = idaapi.get_func(parse_address(item["func_addr"]))
+                func_addr = item.get("func_addr") or item.get("func")
+                old_name = item.get("old") or item.get("name")
+                new_name = item.get("new") or item.get("new_name")
+                if not func_addr or not old_name or not new_name:
+                    result = {
+                        "func_addr": func_addr,
+                        "old": old_name,
+                        "new": new_name,
+                        "error": "Stack rename requires func_addr + old + new",
+                    }
+                    results.append(result)
+                    if stop_on_error:
+                        halted = True
+                        break
+                    continue
+
+                func = idaapi.get_func(parse_address(func_addr))
                 if not func:
-                    results.append(
-                        {
-                            "func_addr": item["func_addr"],
-                            "old": item["old"],
-                            "new": item["new"],
-                            "ok": False,
-                            "error": "No function found",
-                        }
-                    )
+                    result = {
+                        "func_addr": func_addr,
+                        "old": old_name,
+                        "new": new_name,
+                        "error": "No function found",
+                    }
+                    results.append(result)
+                    if stop_on_error:
+                        halted = True
+                        break
                     continue
 
                 frame_tif = ida_typeinf.tinfo_t()
                 if not ida_frame.get_func_frame(frame_tif, func):
-                    results.append(
-                        {
-                            "func_addr": item["func_addr"],
-                            "old": item["old"],
-                            "new": item["new"],
-                            "ok": False,
-                            "error": "No frame",
-                        }
-                    )
+                    result = {
+                        "func_addr": func_addr,
+                        "old": old_name,
+                        "new": new_name,
+                        "error": "No frame",
+                    }
+                    results.append(result)
+                    if stop_on_error:
+                        halted = True
+                        break
                     continue
 
-                idx, udm = frame_tif.get_udm(item["old"])
+                idx, udm = frame_tif.get_udm(old_name)
                 if not udm:
-                    results.append(
-                        {
-                            "func_addr": item["func_addr"],
-                            "old": item["old"],
-                            "new": item["new"],
-                            "ok": False,
-                            "error": f"'{item['old']}' not found",
-                        }
-                    )
+                    result = {
+                        "func_addr": func_addr,
+                        "old": old_name,
+                        "new": new_name,
+                        "error": f"'{old_name}' not found",
+                    }
+                    results.append(result)
+                    if stop_on_error:
+                        halted = True
+                        break
                     continue
 
                 tid = frame_tif.get_udm_tid(idx)
                 if ida_frame.is_special_frame_member(tid):
-                    results.append(
-                        {
-                            "func_addr": item["func_addr"],
-                            "old": item["old"],
-                            "new": item["new"],
-                            "ok": False,
-                            "error": "Special frame member",
-                        }
-                    )
+                    result = {
+                        "func_addr": func_addr,
+                        "old": old_name,
+                        "new": new_name,
+                        "error": "Special frame member",
+                    }
+                    results.append(result)
+                    if stop_on_error:
+                        halted = True
+                        break
                     continue
 
                 udm = ida_typeinf.udm_t()
                 frame_tif.get_udm_by_tid(udm, tid)
                 offset = udm.offset // 8
                 if ida_frame.is_funcarg_off(func, offset):
-                    results.append(
-                        {
-                            "func_addr": item["func_addr"],
-                            "old": item["old"],
-                            "new": item["new"],
-                            "ok": False,
-                            "error": "Argument member",
-                        }
-                    )
+                    result = {
+                        "func_addr": func_addr,
+                        "old": old_name,
+                        "new": new_name,
+                        "error": "Argument member",
+                    }
+                    results.append(result)
+                    if stop_on_error:
+                        halted = True
+                        break
                     continue
 
-                sval = ida_frame.soff_to_fpoff(func, offset)
-                success = ida_frame.define_stkvar(func, item["new"], sval, udm.type)
-                results.append(
-                    {
-                        "func_addr": item["func_addr"],
-                        "old": item["old"],
-                        "new": item["new"],
-                        "ok": success,
-                        "error": None if success else "Rename failed",
-                    }
-                )
+                success = True
+                error = None
+                if not dry_run:
+                    sval = ida_frame.soff_to_fpoff(func, offset)
+                    success = ida_frame.define_stkvar(func, new_name, sval, udm.type)
+                if not success:
+                    error = "Rename failed"
+
+                result = {
+                    "func_addr": func_addr,
+                    "old": old_name,
+                    "new": new_name,
+                }
+                if error:
+                    result["error"] = error
+                if dry_run:
+                    result["dry_run"] = True
+                results.append(result)
+                if not success and stop_on_error:
+                    halted = True
+                    break
             except Exception as e:
                 results.append({"func_addr": item.get("func_addr"), "error": str(e)})
-        return results
+                if stop_on_error:
+                    halted = True
+                    break
+        return results, halted
+    data_items = []
+    data_items.extend(_normalize_items(batch.get("data")))
+    data_items.extend(_normalize_items(batch.get("global")))
+    data_items.extend(_normalize_items(batch.get("globals")))
 
-    # Process each category
-    result = {}
-    if "func" in batch:
-        result["func"] = _rename_funcs(_normalize_items(batch["func"]))
-    if "data" in batch:
-        result["data"] = _rename_globals(_normalize_items(batch["data"]))
-    if "local" in batch:
-        result["local"] = _rename_locals(_normalize_items(batch["local"]))
-    if "stack" in batch:
-        result["stack"] = _rename_stack(_normalize_items(batch["stack"]))
+    requested = {
+        "func": "func" in batch,
+        "data": any(key in batch for key in ("data", "global", "globals")),
+        "local": "local" in batch,
+        "stack": "stack" in batch,
+        "global_alias": any(key in batch for key in ("global", "globals")),
+    }
 
+    result: dict = {}
+    stopped = False
+    stopped_at = None
+
+    if requested["func"]:
+        result["func"], halted = _rename_funcs(_normalize_items(batch.get("func")))
+        if halted:
+            stopped = True
+            stopped_at = "func"
+
+    if requested["data"] and not stopped:
+        result["data"], halted = _rename_globals(data_items)
+        if requested["global_alias"]:
+            result["global"] = list(result["data"])
+        if halted:
+            stopped = True
+            stopped_at = "data"
+
+    if requested["local"] and not stopped:
+        result["local"], halted = _rename_locals(_normalize_items(batch.get("local")))
+        if halted:
+            stopped = True
+            stopped_at = "local"
+
+    if requested["stack"] and not stopped:
+        result["stack"], halted = _rename_stack(_normalize_items(batch.get("stack")))
+        if halted:
+            stopped = True
+            stopped_at = "stack"
+
+    total = 0
+    ok = 0
+    failed = 0
+    for key in ("func", "data", "local", "stack"):
+        for item in result.get(key, []):
+            total += 1
+            if "error" not in item:
+                ok += 1
+            else:
+                failed += 1
+
+    summary: dict = {
+        "total": total,
+        "ok": ok,
+        "failed": failed,
+        "stopped": stopped,
+    }
+    if dry_run:
+        summary["dry_run"] = True
+    if allow_overwrite:
+        summary["allow_overwrite"] = True
+    if stop_on_error:
+        summary["stop_on_error"] = True
+    if stopped:
+        summary["stopped_at"] = stopped_at
+    result["summary"] = summary
     return result
 
 
 @tool
 @idasync
-def define_func(items: list[DefineOp] | DefineOp) -> list[dict]:
-    """Define function(s) at address(es). IDA auto-determines bounds unless end address specified."""
+def define_func(items: list[DefineOp] | DefineOp) -> list[DefineResult]:
+    """Define functions; IDA infers bounds unless end is provided."""
     if isinstance(items, dict):
         items = [items]
 
@@ -438,7 +816,6 @@ def define_func(items: list[DefineOp] | DefineOp) -> list[dict]:
                         "addr": addr_str,
                         "start": hex(func.start_ea),
                         "end": hex(func.end_ea),
-                        "ok": True,
                     }
                 )
             else:
@@ -457,7 +834,7 @@ def define_func(items: list[DefineOp] | DefineOp) -> list[dict]:
 
 @tool
 @idasync
-def define_code(items: list[DefineOp] | DefineOp) -> list[dict]:
+def define_code(items: list[DefineOp] | DefineOp) -> list[DefineResult]:
     """Convert bytes to code instruction(s) at address(es)."""
     if isinstance(items, dict):
         items = [items]
@@ -471,7 +848,7 @@ def define_code(items: list[DefineOp] | DefineOp) -> list[dict]:
             length = ida_ua.create_insn(ea)
             if length > 0:
                 results.append(
-                    {"addr": addr_str, "ea": hex(ea), "length": length, "ok": True}
+                    {"addr": addr_str, "ea": hex(ea), "length": length}
                 )
             else:
                 results.append(
@@ -489,7 +866,7 @@ def define_code(items: list[DefineOp] | DefineOp) -> list[dict]:
 
 @tool
 @idasync
-def undefine(items: list[UndefineOp] | UndefineOp) -> list[dict]:
+def undefine(items: list[UndefineOp] | UndefineOp) -> list[DefineResult]:
     """Undefine item(s) at address(es), converting back to raw bytes."""
     if isinstance(items, dict):
         items = [items]
@@ -520,7 +897,6 @@ def undefine(items: list[UndefineOp] | UndefineOp) -> list[dict]:
                         "addr": addr_str,
                         "start": hex(start_ea),
                         "size": nbytes,
-                        "ok": True,
                     }
                 )
             else:

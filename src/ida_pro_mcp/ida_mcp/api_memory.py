@@ -7,7 +7,7 @@ granularities (bytes, integers, strings) and patching binary data.
 import json
 import re
 
-from typing import Annotated
+from typing import Annotated, NotRequired, TypedDict
 import ida_bytes
 import idaapi
 import idc
@@ -21,7 +21,47 @@ from .utils import (
     MemoryRead,
     normalize_list_input,
     parse_address,
+    read_bytes_bss_safe,
+    read_int_bss_safe,
 )
+
+
+class BytesReadResult(TypedDict):
+    addr: str | None
+    data: str | None
+    error: NotRequired[str]
+
+
+class IntReadResult(TypedDict):
+    addr: str
+    ty: str
+    value: int | None
+    error: NotRequired[str]
+
+
+class StringReadResult(TypedDict):
+    addr: str
+    value: str | None
+    error: NotRequired[str]
+
+
+class GlobalValueResult(TypedDict):
+    query: str
+    value: str | None
+    error: NotRequired[str]
+
+
+class PatchResult(TypedDict):
+    addr: str | None
+    size: int
+    error: NotRequired[str]
+
+
+class IntWriteResult(TypedDict):
+    addr: str
+    ty: str
+    value: str | None
+    error: NotRequired[str]
 
 
 # ============================================================================
@@ -76,7 +116,7 @@ def get_bytes(
         list[MemoryRead] | MemoryRead | str,
         "内存区域。格式: {addr,size}、数组、或字符串'addr:size'(例'0x401000:16'、'0x401000:16, 0x402000:8')。",
     ],
-) -> list[dict]:
+) -> list[BytesReadResult]:
     """从内存读取原始字节。输入格式: 对象{addr,size}、数组、或字符串'addr:size'(例'0x401000:16'、'0x401000:16, 0x402000:8')。返回 addr,data(hex)。"""
     regions = _normalize_regions(regions)
     if not regions:
@@ -89,7 +129,8 @@ def get_bytes(
 
         try:
             ea = parse_address(addr)
-            data = " ".join(f"{x:#02x}" for x in ida_bytes.get_bytes(ea, size))
+            raw = read_bytes_bss_safe(ea, size)
+            data = " ".join(f"{x:#02x}" for x in raw)
             results.append({"addr": addr, "data": data})
         except Exception as e:
             results.append({"addr": addr, "data": None, "error": str(e)})
@@ -140,7 +181,7 @@ def get_int(
         list[IntRead] | IntRead,
         "整数读取: {addr,ty}。ty 格式: i8/u8/i16le/i16be/u32le/u64。例: {addr:'0x401000',ty:'u32le'}",
     ],
-) -> list[dict]:
+) -> list[IntReadResult]:
     """从指定地址按类型读整数。支持有符号(i)无符号(u)、8/16/32/64位、大小端(le/be)。返回 addr,ty,value。"""
     if isinstance(queries, dict):
         queries = [queries]
@@ -154,13 +195,13 @@ def get_int(
             bits, signed, byte_order, normalized = _parse_int_class(ty)
             ea = parse_address(addr)
             size = bits // 8
-            data = ida_bytes.get_bytes(ea, size)
-            if not data or len(data) != size:
+            data = read_bytes_bss_safe(ea, size)
+            if len(data) != size:
                 raise ValueError(f"Failed to read {size} bytes at {addr}")
 
             value = int.from_bytes(data, byte_order, signed=signed)
             results.append(
-                {"addr": addr, "ty": normalized, "value": value, "error": None}
+                {"addr": addr, "ty": normalized, "value": value}
             )
         except Exception as e:
             results.append({"addr": addr, "ty": ty, "value": None, "error": str(e)})
@@ -175,7 +216,7 @@ def get_string(
         list[str] | str,
         "地址，支持 hex/十进制/逗号分隔。例: '0x403000' 或 '0x403000, 0x403010'",
     ],
-) -> list[dict]:
+) -> list[StringReadResult]:
     """从地址读取 IDA 识别的字符串(C/宽字符)。返回 addr,value。若该址无字符串则 error。"""
     addrs = normalize_list_input(addrs)
     results = []
@@ -232,16 +273,10 @@ def get_global_variable_value_internal(ea: int) -> str:
             return '""'
         return_string = raw.decode("utf-8", errors="replace").strip()
         return f'"{return_string}"'
-    elif size == 1:
-        return hex(ida_bytes.get_byte(ea))
-    elif size == 2:
-        return hex(ida_bytes.get_word(ea))
-    elif size == 4:
-        return hex(ida_bytes.get_dword(ea))
-    elif size == 8:
-        return hex(ida_bytes.get_qword(ea))
-    else:
-        return " ".join(hex(x) for x in ida_bytes.get_bytes(ea, size))
+
+    if size in (1, 2, 4, 8):
+        return hex(read_int_bss_safe(ea, size))
+    return " ".join(hex(b) for b in read_bytes_bss_safe(ea, size))
 
 
 @tool
@@ -251,7 +286,7 @@ def get_global_value(
         list[str] | str,
         "全局变量地址或名称。例: '0x403000'、'globalVar'、'isDemoVersion'。按类型解析返回值。",
     ],
-) -> list[dict]:
+) -> list[GlobalValueResult]:
     """按地址或符号名读取全局变量值。自动识别 hex 地址 vs 名称。需 IDA 已定义该全局类型。"""
     from .utils import looks_like_address
 
@@ -278,7 +313,7 @@ def get_global_value(
                 continue
 
             value = get_global_variable_value_internal(ea)
-            results.append({"query": query, "value": value, "error": None})
+            results.append({"query": query, "value": value})
         except Exception as e:
             results.append({"query": query, "value": None, "error": str(e)})
 
@@ -292,7 +327,7 @@ def get_global_value(
 
 @tool
 @idasync
-def patch(patches: list[MemoryPatch] | MemoryPatch) -> list[dict]:
+def patch(patches: list[MemoryPatch] | MemoryPatch) -> list[PatchResult]:
     """Patch bytes at memory addresses with hex data"""
     if isinstance(patches, dict):
         patches = [patches]
@@ -309,7 +344,7 @@ def patch(patches: list[MemoryPatch] | MemoryPatch) -> list[dict]:
 
             ida_bytes.patch_bytes(ea, data)
             results.append(
-                {"addr": patch["addr"], "size": len(data), "ok": True, "error": None}
+                {"addr": patch["addr"], "size": len(data)}
             )
 
         except Exception as e:
@@ -325,7 +360,7 @@ def put_int(
         list[IntWrite] | IntWrite,
         "Integer write requests (ty, addr, value). value is a string; supports 0x.. and negatives",
     ],
-) -> list[dict]:
+) -> list[IntWriteResult]:
     """Write integer values to memory addresses"""
     if isinstance(items, dict):
         items = [items]
@@ -354,8 +389,6 @@ def put_int(
                     "addr": addr,
                     "ty": normalized,
                     "value": str(value_text),
-                    "ok": True,
-                    "error": None,
                 }
             )
         except Exception as e:
@@ -364,7 +397,6 @@ def put_int(
                     "addr": addr,
                     "ty": ty,
                     "value": str(value_text) if value_text is not None else None,
-                    "ok": False,
                     "error": str(e),
                 }
             )

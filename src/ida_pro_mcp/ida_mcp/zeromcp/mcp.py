@@ -7,6 +7,7 @@ import uuid
 import json
 import gzip
 import zlib
+import ipaddress
 import inspect
 import threading
 import traceback
@@ -63,6 +64,61 @@ class _McpSseConnection:
             self.alive = False
             return False
 
+
+def _origin_allowed_by_policy(
+    allowed: Callable[[str], bool] | list[str] | str | None,
+    origin: str,
+) -> bool:
+    if not origin or allowed is None:
+        return False
+    if callable(allowed):
+        return allowed(origin)
+    if isinstance(allowed, str):
+        allowed = [allowed]
+    return "*" in allowed or origin in allowed
+
+
+def _parse_host_header(host_header: str | None) -> str | None:
+    if not host_header:
+        return None
+
+    host_header = host_header.strip()
+    if not host_header:
+        return None
+
+    if host_header.startswith("["):
+        end = host_header.find("]")
+        if end == -1:
+            return None
+        return host_header[1:end]
+
+    if host_header.count(":") == 1:
+        return host_header.rsplit(":", 1)[0]
+
+    return host_header
+
+
+def _is_loopback_host(host: str) -> bool:
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host.lower() == "localhost"
+
+
+def _host_header_allowed_for_bind(bound_host: str, host_header: str | None) -> bool:
+    """Reject DNS-rebinding style Host headers when the server is loopback-bound."""
+    if host_header is None:
+        return True
+
+    host_name = _parse_host_header(host_header)
+    if host_name is None:
+        return False
+
+    if not _is_loopback_host(bound_host):
+        return True
+
+    return _is_loopback_host(host_name)
+
 class McpHttpRequestHandler(BaseHTTPRequestHandler):
     server_version = "zeromcp/1.3.0"
     error_message_format = "%(code)d - %(message)s"
@@ -86,19 +142,7 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
 
     def send_cors_headers(self, *, preflight = False):
         origin = self.headers.get("Origin", "")
-        if not origin:
-            return
-        def is_allowed():
-            allowed = self.mcp_server.cors_allowed_origins
-            if allowed is None:
-                return False
-            if callable(allowed):
-                return allowed(origin)
-            if isinstance(allowed, str):
-                allowed = [allowed]
-            assert isinstance(allowed, list)
-            return "*" in allowed or origin in allowed
-        if not is_allowed():
+        if not _origin_allowed_by_policy(self.mcp_server.cors_allowed_origins, origin):
             return
         self.send_header("Access-Control-Allow-Origin", origin)
         if preflight:
@@ -122,7 +166,30 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             # Client disconnected - normal, suppress traceback
             pass
 
+    def _check_api_request(self) -> bool:
+        """Block browser traffic that violates the configured origin policy.
+
+        Browsers can bypass passive CORS-only defenses during DNS rebinding
+        because same-origin requests do not need CORS. Rejecting unexpected Host
+        and Origin headers closes that gap while keeping direct clients working.
+        """
+        bound_host = self.server.server_address[0]
+        if not _host_header_allowed_for_bind(bound_host, self.headers.get("Host")):
+            self.send_error(403, "Invalid Host")
+            return False
+
+        origin = self.headers.get("Origin", "")
+        if origin and not _origin_allowed_by_policy(
+            self.mcp_server.cors_allowed_origins, origin
+        ):
+            self.send_error(403, "Invalid Origin")
+            return False
+
+        return True
+
     def do_GET(self):
+        if not self._check_api_request():
+            return
         match urlparse(self.path).path:
             case "/sse":
                 self._handle_sse_get()
@@ -132,6 +199,8 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
                 self.send_error(404, "Not Found")
 
     def do_POST(self):
+        if not self._check_api_request():
+            return
         body = self._read_body()
         if body is None:
             return
@@ -146,6 +215,8 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self):
         """Handle CORS preflight requests"""
+        if not self._check_api_request():
+            return
         self.send_response(200)
         self.send_cors_headers(preflight=True)
         self.end_headers()
@@ -168,6 +239,7 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
 
     def _read_chunked(self) -> bytes:
         body = b""
+        limit = self.mcp_server.post_body_limit
         while True:
             line = self.rfile.readline().split(b";")[0].strip()
             chunk_size = int(line, 16)
@@ -176,7 +248,9 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
                 while self.rfile.readline().strip():
                     pass
                 break
-            body += self.rfile.read(chunk_size)
+            body += self.rfile.read(min(chunk_size, limit + 1 - len(body)))
+            if len(body) > limit:
+                return body
             self.rfile.readline()
         return body
 
@@ -384,6 +458,7 @@ class McpServer:
         self.registry.methods["resources/unsubscribe"] = self._mcp_resources_unsubscribe
         self.registry.methods["prompts/list"] = self._mcp_prompts_list
         self.registry.methods["prompts/get"] = self._mcp_prompts_get
+        self.registry.methods["notifications/initialized"] = self._mcp_notifications_initialized
         self.registry.methods["notifications/cancelled"] = self._mcp_notifications_cancelled
 
     def tool(self, func: Callable) -> Callable:
@@ -410,11 +485,20 @@ class McpServer:
             request_handler,
             bind_and_activate=False
         )
-        # allow_reuse_address=True allows fast restarts (skip TCP TIME_WAIT).
-        # Do NOT set allow_reuse_port: on macOS SO_REUSEPORT lets multiple
-        # processes silently bind the same port, causing request mis-routing
-        # and SIGPIPE crashes when one instance closes.
-        self._http_server.allow_reuse_address = True
+        # Fast restarts: skip TCP TIME_WAIT so a port can be reused immediately
+        # after the server stops. On Windows, SO_REUSEADDR is dangerous (allows
+        # multiple processes to bind the same port silently), so we use
+        # SO_EXCLUSIVEADDRUSE instead, which still allows TIME_WAIT reuse but
+        # prevents port hijacking. On Unix, SO_REUSEADDR is the correct option.
+        import sys
+        if sys.platform == "win32":
+            import socket
+            self._http_server.allow_reuse_address = False
+            self._http_server.socket.setsockopt(
+                socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1  # type: ignore[attr-defined]
+            )
+        else:
+            self._http_server.allow_reuse_address = True
 
         # Set the MCPServer instance on the handler class
         setattr(self._http_server, "mcp_server", self)
@@ -596,13 +680,17 @@ class McpServer:
 
             result = tool_response.get("result") if tool_response else None
             return {
-                "content": [{"type": "text", "text": json.dumps(result, indent=2)}],
+                "content": [{"type": "text", "text": json.dumps(result, separators=(",", ":"))}],
                 "structuredContent": result if isinstance(result, dict) else {"result": result},
                 "isError": False,
             }
         finally:
             if request_id is not None:
                 unregister_pending_request(request_id)
+
+    def _mcp_notifications_initialized(self) -> None:
+        """MCP notifications/initialized - client signals initialization complete"""
+        # Notifications don't return a response
 
     def _mcp_notifications_cancelled(self, requestId: int | str, reason: str | None = None) -> None:
         """MCP notifications/cancelled - cancel an in-flight request"""
@@ -677,7 +765,7 @@ class McpServer:
                         "contents": [{
                             "uri": uri,
                             "mimeType": "application/json",
-                            "text": json.dumps({"error": error.get("message", "Unknown error")}, indent=2),
+                            "text": json.dumps({"error": error.get("message", "Unknown error")}, separators=(",", ":")),
                         }],
                         "isError": True,
                     }
@@ -687,7 +775,7 @@ class McpServer:
                     "contents": [{
                         "uri": uri,
                         "mimeType": "application/json",
-                        "text": json.dumps(result, indent=2),
+                        "text": json.dumps(result, separators=(",", ":")),
                     }]
                 }
 
@@ -700,7 +788,7 @@ class McpServer:
                 "text": json.dumps({
                     "error": f"Resource not found: {uri}",
                     "available_patterns": available,
-                }, indent=2),
+                }, separators=(",", ":")),
             }],
             "isError": True,
         }
@@ -750,7 +838,7 @@ class McpServer:
 
         # Convert non-string results to JSON
         if not isinstance(result, str):
-            result = json.dumps(result, indent=2)
+            result = json.dumps(result, separators=(",", ":"))
         return {
             "messages": [
                 {
@@ -794,8 +882,23 @@ class McpServer:
 
         return schema
 
+    def _schema_is_object_like(self, schema: dict) -> bool:
+        """Check if a JSON schema always describes a dict at runtime.
+
+        Handles plain objects and anyOf unions where every variant is an object,
+        which matches the unwrapped pass-through in _mcp_tools_call.
+        """
+        if schema.get("type") == "object":
+            return True
+        if "anyOf" in schema:
+            return all(self._schema_is_object_like(s) for s in schema["anyOf"])
+        return False
+
     def _type_to_json_schema(self, py_type: Any) -> dict:
         """Convert Python type hint to JSON schema object"""
+        if py_type is Any:
+            return {}
+
         origin = get_origin(py_type)
         # Annotated[T, "description"]
         if origin is Annotated:
@@ -891,13 +994,20 @@ class McpServer:
         if return_type and return_type is not type(None):
             return_schema = self._type_to_json_schema(return_type)
 
-            # Wrap non-object returns in a "result" property
-            if return_schema.get("type") != "object":
+            # Wrap non-object returns in a "result" property.
+            # _mcp_tools_call passes dicts through unwrapped, so union-of-objects
+            # (anyOf where every variant is an object) must not be wrapped either.
+            if not self._schema_is_object_like(return_schema):
                 return_schema = {
                     "type": "object",
                     "properties": {"result": return_schema},
                     "required": ["result"],
                 }
+            elif return_schema.get("type") != "object":
+                # anyOf-of-objects: MCP spec requires outputSchema root to be
+                # type:"object". Hoist it so validators (e.g. MCP Inspector)
+                # accept the schema while anyOf still constrains the variants.
+                return_schema = {"type": "object", **return_schema}
 
             schema["outputSchema"] = return_schema
 

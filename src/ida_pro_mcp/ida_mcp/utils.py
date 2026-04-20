@@ -18,6 +18,7 @@ from typing import (
     overload,
 )
 
+import ida_bytes
 import ida_funcs
 import ida_hexrays
 import ida_kernwin
@@ -85,6 +86,17 @@ class CommentOp(TypedDict):
     comment: Annotated[str, "Comment text"]
 
 
+class CommentAppendOp(TypedDict):
+    """Comment append operation"""
+
+    addr: Annotated[str, "Address (hex or decimal)"]
+    comment: Annotated[str, "Comment text to append"]
+    scope: NotRequired[Annotated[str, "auto|func|line (default: auto)"]]
+    dedupe: NotRequired[
+        Annotated[bool, "Skip if exact text already exists (default: true)"]
+    ]
+
+
 class AsmPatchOp(TypedDict):
     """Assembly patch operation"""
 
@@ -109,7 +121,7 @@ class GlobalRename(TypedDict):
 class LocalRename(TypedDict):
     """Local variable rename operation"""
 
-    func_addr: Annotated[str, "Function address containing the local variable"]
+    func_addr: Annotated[str, "Function address"]
     old: Annotated[str, "Current variable name"]
     new: Annotated[str, "New variable name"]
 
@@ -117,27 +129,32 @@ class LocalRename(TypedDict):
 class StackRename(TypedDict):
     """Stack variable rename operation"""
 
-    func_addr: Annotated[str, "Function address containing the stack variable"]
+    func_addr: Annotated[str, "Function address"]
     old: Annotated[str, "Current variable name"]
     new: Annotated[str, "New variable name"]
 
 
 class RenameBatch(TypedDict, total=False):
-    """Batch rename operations across all entity types"""
+    """Batch rename operations across all entity types.
+
+    At least one of func/data/local/stack should be present.
+    """
 
     func: Annotated[
-        list[FunctionRename] | FunctionRename | None, "Function rename operations"
+        list[FunctionRename] | FunctionRename, "Function rename operations"
     ]
     data: Annotated[
-        list[GlobalRename] | GlobalRename | None,
-        "Global/data variable rename operations",
+        list[GlobalRename] | GlobalRename, "Global/data variable rename operations"
     ]
     local: Annotated[
-        list[LocalRename] | LocalRename | None, "Local variable rename operations"
+        list[LocalRename] | LocalRename, "Local variable rename operations"
     ]
     stack: Annotated[
-        list[StackRename] | StackRename | None, "Stack variable rename operations"
+        list[StackRename] | StackRename, "Stack variable rename operations"
     ]
+    stop_on_error: Annotated[bool, "Stop on first failure"]
+    dry_run: Annotated[bool, "Validate only, no changes"]
+    allow_overwrite: Annotated[bool, "Force overwrite existing names"]
 
 
 class StructFieldQuery(TypedDict):
@@ -147,12 +164,127 @@ class StructFieldQuery(TypedDict):
     field: Annotated[str, "Field name"]
 
 
+class XrefQuery(TypedDict):
+    """Generic cross-reference query"""
+
+    addr: Annotated[str, "Address or name"]
+    direction: NotRequired[Annotated[str, "to|from|both (default: both)"]]
+    xref_type: NotRequired[Annotated[str, "any|code|data (default: any)"]]
+    offset: NotRequired[Annotated[int, "Start index (default: 0)"]]
+    count: NotRequired[Annotated[int, "Max results (default: 200, max: 5000)"]]
+    include_fn: NotRequired[Annotated[bool, "Include function metadata"]]
+    dedup: NotRequired[Annotated[bool, "Deduplicate by addr/type"]]
+    sort_by: NotRequired[Annotated[str, "Sort: addr|type"]]
+    descending: NotRequired[Annotated[bool, "Descending"]]
+
+
 class ListQuery(TypedDict, total=False):
     """Pagination query for listing operations"""
 
     filter: Annotated[str, "glob 过滤，如 main、*init*、空=全部"]
     offset: Annotated[int, "起始索引，默认 0"]
     count: Annotated[int, "返回数量，默认 50，0=全部"]
+
+
+class FunctionQuery(TypedDict, total=False):
+    """Function query with richer filtering"""
+
+    filter: Annotated[str, "Name glob/regex"]
+    name_regex: Annotated[str, "Name regex"]
+    min_size: Annotated[int, "Min size in bytes"]
+    max_size: Annotated[int, "Max size in bytes"]
+    has_type: Annotated[bool, "Require type info"]
+    offset: Annotated[int, "Start index"]
+    count: Annotated[int, "Max results (0=all)"]
+    sort_by: Annotated[str, "Sort: addr|name|size"]
+    descending: Annotated[bool, "Descending"]
+
+
+class EntityQuery(TypedDict):
+    """Generic IDB entity query with filtering, projection, and pagination"""
+
+    kind: Annotated[str, "functions|globals|imports|strings|names"]
+    filter: NotRequired[Annotated[str, "Glob/regex filter"]]
+    regex: NotRequired[Annotated[str, "Regex on primary text field"]]
+    min_addr: NotRequired[Annotated[str, "Min address bound"]]
+    max_addr: NotRequired[Annotated[str, "Max address bound"]]
+    segment: NotRequired[Annotated[str, "Segment filter"]]
+    module: NotRequired[Annotated[str, "Import module filter"]]
+    offset: NotRequired[Annotated[int, "Start index"]]
+    count: NotRequired[Annotated[int, "Max results (0=all)"]]
+    sort_by: NotRequired[Annotated[str, "Sort: addr|name|size|length"]]
+    descending: NotRequired[Annotated[bool, "Descending"]]
+    fields: NotRequired[Annotated[list[str], "Projection field list"]]
+
+
+class FuncProfileQuery(TypedDict, total=False):
+    """Function profiling query with pagination and optional detail lists.
+
+    All fields are optional - omit addr to profile all functions.
+    """
+
+    addr: Annotated[str, "Function address or name (omit or '*' for all)"]
+    filter: Annotated[str, "Name glob/regex"]
+    offset: Annotated[int, "Start index"]
+    count: Annotated[int, "Max results (0=all)"]
+    sort_by: Annotated[str, "Sort: addr|name|size"]
+    descending: Annotated[bool, "Descending"]
+    include_lists: Annotated[bool, "Include callers/callees/strings/constants"]
+    max_items: Annotated[int, "Max items per list"]
+    include_prototype: Annotated[bool, "Include prototype"]
+
+
+class AnalyzeBatchQuery(TypedDict):
+    """Comprehensive function analysis request"""
+
+    addr: Annotated[str, "Function address or name"]
+    include_decompile: NotRequired[Annotated[bool, "Include decompiler output"]]
+    include_disasm: NotRequired[Annotated[bool, "Include disassembly"]]
+    include_xrefs: NotRequired[Annotated[bool, "Include xrefs-to/from"]]
+    include_callers: NotRequired[Annotated[bool, "Include callers"]]
+    include_callees: NotRequired[Annotated[bool, "Include callees"]]
+    include_strings: NotRequired[Annotated[bool, "Include strings"]]
+    include_constants: NotRequired[Annotated[bool, "Include constants"]]
+    include_basic_blocks: NotRequired[Annotated[bool, "Include basic blocks"]]
+    include_proto: NotRequired[Annotated[bool, "Include prototype"]]
+    max_disasm_insns: NotRequired[Annotated[int, "Max disasm instructions"]]
+    max_callers: NotRequired[Annotated[int, "Max callers"]]
+    max_callees: NotRequired[Annotated[int, "Max callees"]]
+    max_strings: NotRequired[Annotated[int, "Max strings"]]
+    max_constants: NotRequired[Annotated[int, "Max constants"]]
+    max_blocks: NotRequired[Annotated[int, "Max blocks"]]
+
+
+class ImportQuery(TypedDict, total=False):
+    """Import query with filtering and pagination"""
+
+    filter: Annotated[str, "Name glob/regex"]
+    module: Annotated[str, "Module glob/regex"]
+    offset: Annotated[int, "Start index"]
+    count: Annotated[int, "Max results (0=all)"]
+
+
+class TypeInspectQuery(TypedDict):
+    """Type inspection request"""
+
+    name: Annotated[str, "Type name"]
+    include_members: NotRequired[Annotated[bool, "Include UDT member details"]]
+    max_members: NotRequired[Annotated[int, "Max members"]]
+
+
+class TypeQuery(TypedDict, total=False):
+    """Type catalog query with filtering, pagination, and optional relationships"""
+
+    filter: Annotated[str, "Name glob/regex"]
+    kind: Annotated[str, "any|struct|union|enum|typedef|func|ptr|udt"]
+    offset: Annotated[int, "Start index"]
+    count: Annotated[int, "Max results (0=all)"]
+    sort_by: Annotated[str, "Sort: name|size|ordinal"]
+    descending: Annotated[bool, "Descending"]
+    include_decl: Annotated[bool, "Include declaration text"]
+    include_members: Annotated[bool, "Include UDT member details"]
+    max_members: Annotated[int, "Max members per UDT"]
+    include_relationships: Annotated[bool, "Include related type names"]
 
 
 class BreakpointOp(TypedDict):
@@ -165,22 +297,21 @@ class BreakpointOp(TypedDict):
 class InsnPattern(TypedDict, total=False):
     """Instruction pattern for operand search"""
 
-    mnem: Annotated[str, "Instruction mnemonic to match"]
-    op0: Annotated[int, "Value to match in first operand"]
-    op1: Annotated[int, "Value to match in second operand"]
-    op2: Annotated[int, "Value to match in third operand"]
-    op_any: Annotated[int, "Value to match in any operand"]
-    func: Annotated[str, "Function address to scope the scan"]
-    segment: Annotated[str, "Segment name to scope the scan"]
-    start: Annotated[str, "Start address (hex/dec) to scope the scan"]
-    end: Annotated[str, "End address (hex/dec, exclusive) to scope the scan"]
-    max_scan_insns: Annotated[
-        int, "Max instructions to scan (default: 200000, max: 2000000)"
-    ]
-    allow_broad: Annotated[
-        bool,
-        "Allow scans without scope (default: false). Use with care on large binaries.",
-    ]
+    mnem: Annotated[str, "Mnemonic to match"]
+    op0: Annotated[int, "Match first operand"]
+    op1: Annotated[int, "Match second operand"]
+    op2: Annotated[int, "Match third operand"]
+    op_any: Annotated[int, "Match any operand"]
+    func: Annotated[str, "Scope: function address"]
+    segment: Annotated[str, "Scope: segment name"]
+    start: Annotated[str, "Scope: start address"]
+    end: Annotated[str, "Scope: end address (exclusive)"]
+    offset: Annotated[int, "Start index"]
+    count: Annotated[int, "Max matches (max: 5000)"]
+    max_scan_insns: Annotated[int, "Max instructions to scan"]
+    include_fn: Annotated[bool, "Include function metadata"]
+    include_disasm: Annotated[bool, "Include disassembly text"]
+    allow_broad: Annotated[bool, "Allow scopeless scan"]
 
 
 class NumberConversion(TypedDict, total=False):
@@ -197,21 +328,41 @@ class StructRead(TypedDict, total=False):
     to auto-detect from type information already applied at the address.
     """
 
-    addr: Annotated[str, "Memory address (hex or decimal)"]
-    struct: Annotated[
-        NotRequired[str], "Structure name (optional, auto-detect if omitted)"
-    ]
+    addr: Annotated[str, "Address"]
+    struct: Annotated[NotRequired[str], "Struct name (auto-detect if omitted)"]
 
 
-class TypeEdit(TypedDict, total=False):
+class TypeEdit(TypedDict):
     """Type application operation"""
 
-    addr: Annotated[str, "Memory address"]
-    name: Annotated[str, "Variable/function name"]
-    ty: Annotated[str, "Type name or declaration"]
-    kind: Annotated[str, "Type of entity (auto-detected if omitted)"]
-    signature: Annotated[str, "Function signature (for kind=function)"]
-    variable: Annotated[str, "Local variable name (for kind=local)"]
+    addr: Annotated[str, "Address (function, global, or stack frame)"]
+    ty: NotRequired[Annotated[str, "Type name or declaration"]]
+    name: NotRequired[Annotated[str, "Variable/function name"]]
+    kind: NotRequired[Annotated[str, "Entity kind (auto-detected)"]]
+    signature: NotRequired[Annotated[str, "Function signature"]]
+    variable: NotRequired[Annotated[str, "Local variable name"]]
+
+
+class EnumMemberUpsert(TypedDict, total=False):
+    """Enum member upsert operation"""
+
+    name: Annotated[str, "Enum member name"]
+    value: Annotated[int | str, "Enum member value"]
+
+
+class EnumUpsert(TypedDict, total=False):
+    """Enum create/update operation"""
+
+    name: Annotated[str, "Enum type name"]
+    members: Annotated[list[EnumMemberUpsert] | EnumMemberUpsert, "Members to upsert"]
+    bitfield: Annotated[bool, "Bitfield enum"]
+
+
+class TypeApplyBatch(TypedDict):
+    """Batch type application configuration"""
+
+    edits: Annotated[list[TypeEdit] | TypeEdit, "Type edits to apply"]
+    stop_on_error: NotRequired[Annotated[bool, "Stop on first failure"]]
 
 
 class StackVarDecl(TypedDict):
@@ -302,12 +453,19 @@ class Segment(TypedDict):
     permissions: str
 
 
+class Ref(TypedDict):
+    addr: str
+    name: str
+    string: NotRequired[str]
+
+
 class DisassemblyLine(TypedDict):
     segment: NotRequired[str]
     addr: str
     label: NotRequired[str]
     instruction: str
     comments: NotRequired[list[str]]
+    refs: NotRequired[list[Ref]]
 
 
 class Argument(TypedDict):
@@ -325,9 +483,10 @@ class StackFrameVariable(TypedDict):
 class DisassemblyFunction(TypedDict):
     name: str
     start_ea: str
+    segment: NotRequired[str]
     return_type: NotRequired[str]
     arguments: NotRequired[list[Argument]]
-    stack_frame: list[StackFrameVariable]
+    stack_frame: NotRequired[list[StackFrameVariable]]
     lines: list[DisassemblyLine]
 
 
@@ -447,24 +606,57 @@ def parse_address(addr: str | int) -> int:
             return int("0x" + s, 16)
         return v
     except ValueError:
-        # Pure hex without 0x prefix: auto-prepend 0x
-        if s and all(c in "0123456789abcdefABCDEF" for c in s):
-            return int("0x" + s, 16)
-        raise IDAError(f"Failed to parse address: {addr}")
+        # Try name-to-address resolution before failing
+        try:
+            import idaapi
 
+            ea = idaapi.get_name_ea(idaapi.BADADDR, addr.strip())
+            if ea != idaapi.BADADDR:
+                return ea
+        except ImportError:
+            pass
+        for ch in addr:
+            if ch not in "0123456789abcdefABCDEF":
+                raise IDAError(f"Not found: {addr!r}")
+        raise IDAError(f"Failed to parse address (missing 0x prefix): {addr}")
 
 def parse_address_or_name(addr: str | int) -> int:
-    """Parse address or resolve symbol/function name. For decompile/disasm."""
-    try:
-        return parse_address(addr)
-    except IDAError:
-        pass
-    # Try name lookup (function/symbol)
-    s = str(addr).strip()
-    ea = idaapi.get_name_ea(idaapi.BADADDR, s)
-    if ea != idaapi.BADADDR:
-        return ea
-    raise IDAError(f"Failed to parse address or find symbol: {addr}")
+    return parse_address(addr)
+
+
+def read_bytes_bss_safe(ea: int, size: int) -> bytes:
+    """Read `size` bytes starting at `ea`, substituting 0 for unloaded bytes.
+
+    Unloaded bytes in BSS-like sections are zero at runtime by every mainstream
+    loader, but ida_bytes.get_byte() returns 0xFF as a sentinel for them. Patch
+    that here so reads of globals in .bss return the real zero-initialized
+    value instead of 0xff garbage.
+    """
+    out = bytearray(size)
+    for i in range(size):
+        if ida_bytes.is_loaded(ea + i):
+            out[i] = ida_bytes.get_byte(ea + i)
+    return bytes(out)
+
+
+def read_int_bss_safe(ea: int, size: int) -> int:
+    """Read an integer of `size` bytes at `ea`, honoring IDB endianness.
+
+    Returns 0 if the byte at `ea` is not loaded (BSS / zero-initialized region).
+    Uses IDA's native sized readers (get_byte/word/dword/qword) for loaded
+    bytes so the result respects the database endianness.
+    """
+    if not ida_bytes.is_loaded(ea):
+        return 0
+    if size == 1:
+        return ida_bytes.get_byte(ea)
+    if size == 2:
+        return ida_bytes.get_word(ea)
+    if size == 4:
+        return ida_bytes.get_dword(ea)
+    if size == 8:
+        return ida_bytes.get_qword(ea)
+    raise ValueError(f"unsupported integer size: {size}")
 
 
 def normalize_list_input(value: list | str) -> list:
@@ -672,6 +864,7 @@ def get_type_by_name(type_name: str) -> ida_typeinf.tinfo_t:
         "int64",
         "__int64",
         "int64_t",
+        "signed __int64",
         "long long",
         "long long int",
         "signed long long",
@@ -683,6 +876,7 @@ def get_type_by_name(type_name: str) -> ida_typeinf.tinfo_t:
         "__uint64",
         "uint64_t",
         "unsigned int64",
+        "unsigned __int64",
         "unsigned long long",
         "unsigned long long int",
         "qword",
@@ -723,7 +917,12 @@ def get_type_by_name(type_name: str) -> ida_typeinf.tinfo_t:
         return tif
     if tif.get_named_type(None, type_name, ida_typeinf.BTF_UNION):
         return tif
-    if tif := ida_typeinf.tinfo_t(type_name):
+
+    # Try parse_decl for arbitrary type expressions (works in IDA 9.0+)
+    tif = ida_typeinf.tinfo_t()
+    flags = ida_typeinf.PT_SIL | ida_typeinf.PT_TYP
+    candidate = type_name if type_name.endswith(";") else type_name + ";"
+    if ida_typeinf.parse_decl(tif, None, candidate, flags) is not None and not tif.empty():
         return tif
 
     raise IDAError(f"Unable to retrieve {type_name} type info object")
@@ -896,6 +1095,29 @@ def get_stack_frame_variables_internal(
     return members
 
 
+_STRING_OR_SPACES_RE = re.compile(
+    r'"(?:[^"\\]|\\.)*"'  # double-quoted string
+    r"|'(?:[^'\\]|\\.)*'"  # single-quoted string / char
+    r"|[ \t]{2,}"  # run of 2+ whitespace (outside strings)
+)
+
+
+def compact_whitespace(line: str) -> str:
+    """Collapse runs of 2+ spaces/tabs to a single space, preserving string literals."""
+    stripped = line.lstrip(" \t")
+    if not stripped:
+        return line
+    lead = line[: len(line) - len(stripped)]
+
+    def _repl(m: re.Match) -> str:
+        s = m.group()
+        if s[0] in ('"', "'"):
+            return s  # preserve string content
+        return " "
+
+    return lead + _STRING_OR_SPACES_RE.sub(_repl, stripped)
+
+
 def decompile_checked(addr: int):
     """Decompile a function and raise IDAError on failure (uses cache)"""
     if not ida_hexrays.init_hexrays_plugin():
@@ -917,7 +1139,7 @@ def decompile_checked(addr: int):
     return cfunc
 
 
-def decompile_function_safe(ea: int) -> Optional[str]:
+def decompile_function_safe(ea: int, include_addresses: bool = True) -> Optional[str]:
     """Safely decompile a function, returning None on failure (uses cache)"""
     import ida_lines
     import ida_kernwin
@@ -932,9 +1154,11 @@ def decompile_function_safe(ea: int) -> Optional[str]:
         lines = []
         for sl in sv:
             sl: ida_kernwin.simpleline_t
+            _head = ida_hexrays.ctree_item_t()
             item = ida_hexrays.ctree_item_t()
+            _tail = ida_hexrays.ctree_item_t()
             line_ea = None
-            if cfunc.get_line_item(sl.line, 0, False, None, item, None):
+            if include_addresses and cfunc.get_line_item(sl.line, 0, False, _head, item, _tail):
                 dstr: str | None = item.dstr()
                 if dstr:
                     ds = dstr.split(": ")
@@ -943,7 +1167,7 @@ def decompile_function_safe(ea: int) -> Optional[str]:
                             line_ea = int(ds[0], 16)
                         except ValueError:
                             pass
-            text = ida_lines.tag_remove(sl.line)
+            text = compact_whitespace(ida_lines.tag_remove(sl.line))
             if line_ea is not None:
                 lines.append(f"{text} /*{line_ea:#x}*/")
             else:

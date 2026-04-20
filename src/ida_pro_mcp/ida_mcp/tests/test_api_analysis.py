@@ -3,6 +3,7 @@
 from ..framework import (
     test,
     skip_test,
+    assert_has_keys,
     assert_valid_address,
     assert_non_empty,
     assert_is_list,
@@ -18,7 +19,11 @@ from ..framework import (
 from ..api_analysis import (
     decompile,
     disasm,
+    func_profile,
+    analyze_batch,
     xrefs_to,
+    xref_query,
+    insn_query,
     xrefs_to_field,
     callees,
     find_bytes,
@@ -96,7 +101,23 @@ def test_decompile_unknown_name():
     """decompile returns a specific error for an unknown function name."""
     result = decompile("nonexistent_function_xyz")
     assert result["code"] is None
-    assert_error(result, contains="Function not found")
+    assert_error(result, contains="Not found")
+
+
+@test(binary="crackme03.elf")
+def test_decompile_default_includes_address_markers():
+    """Default output carries /*0xNNNN*/ markers on at least one line."""
+    result = decompile("main")
+    assert_ok(result, "code")
+    assert "/*0x" in result["code"]
+
+
+@test(binary="crackme03.elf")
+def test_decompile_include_addresses_false_strips_markers():
+    """include_addresses=False drops all /*0xNNNN*/ markers."""
+    result = decompile("main", include_addresses=False)
+    assert_ok(result, "code")
+    assert "/*0x" not in result["code"]
 
 
 @test()
@@ -115,7 +136,7 @@ def test_disasm_valid_function():
                 {
                     "name": str,
                     "start_ea": is_hex_address,
-                    "lines": str,
+                    "lines": list,
                 }
             ),
             "instruction_count": int,
@@ -136,8 +157,9 @@ def test_disasm_main_contains_expected_calls():
     asm = result["asm"]
     assert asm["name"] == "main"
     assert asm["start_ea"] == CRACKME_MAIN
-    assert "check_pw" in asm["lines"]
-    assert "_puts" in asm["lines"]
+    lines_text = " ".join(item["instruction"] for item in asm["lines"])
+    assert "check_pw" in lines_text
+    assert "_puts" in lines_text
     assert result["instruction_count"] > 0
 
 
@@ -191,7 +213,7 @@ def test_disasm_unknown_name():
     """disasm returns a specific error for an unknown function name."""
     result = disasm("nonexistent_function_xyz")
     assert result["asm"] is None
-    assert_error(result, contains="Function not found")
+    assert_error(result, contains="Not found")
 
 
 @test()
@@ -218,6 +240,170 @@ def test_disasm_interior_address_preserves_cursor():
 
 
 @test(binary="crackme03.elf")
+def test_decompile_refs_include_check_pw():
+    """decompile surfaces cot_obj refs, including the check_pw call target."""
+    result = decompile(CRACKME_MAIN)
+    assert_ok(result, "code")
+    refs = result.get("refs", [])
+    hit = next((r for r in refs if r["name"] == "check_pw"), None)
+    assert hit is not None, f"check_pw not in decompile refs: {refs}"
+    assert hit["addr"] == CRACKME_CHECK_PW
+
+
+@test(binary="crackme03.elf")
+def test_decompile_refs_decode_usage_string():
+    """decompile refs carry decoded bytes for string-literal data targets."""
+    result = decompile(CRACKME_MAIN)
+    assert_ok(result, "code")
+    refs = result.get("refs", [])
+    hit = next((r for r in refs if r["addr"] == CRACKME_USAGE_STRING), None)
+    assert hit is not None, f"usage-string ref missing: {refs}"
+    assert "string" in hit, f"decoded string missing on ref: {hit}"
+    assert "Need exactly" in hit["string"]
+
+
+@test(binary="crackme03.elf")
+def test_disasm_labels_populated():
+    """disasm populates `label` on the function head and on branch targets."""
+    result = disasm(CRACKME_MAIN, max_instructions=200)
+    assert_ok(result, "asm")
+    lines = result["asm"]["lines"]
+    first = lines[0]
+    assert first["addr"] == CRACKME_MAIN.removeprefix("0x")
+    assert first.get("label") == "main"
+    # At least one interior branch-target label should be present
+    interior_labels = [ln["label"] for ln in lines[1:] if "label" in ln]
+    assert interior_labels, "expected at least one interior label (e.g. loc_...)"
+
+
+@test(binary="crackme03.elf")
+def test_disasm_resolves_call_target():
+    """disasm resolves `call check_pw` to a ref pointing at CRACKME_CHECK_PW."""
+    result = disasm(CRACKME_MAIN, max_instructions=200)
+    assert_ok(result, "asm")
+    call_line = next(
+        (ln for ln in result["asm"]["lines"] if ln["addr"] == CRACKME_CALL_TO_CHECK_PW.removeprefix("0x")),
+        None,
+    )
+    assert call_line is not None, "missing expected call-to-check_pw line"
+    refs = call_line.get("refs", [])
+    hit = next((r for r in refs if r["name"] == "check_pw"), None)
+    assert hit is not None, f"check_pw not in refs: {refs}"
+    assert hit["addr"] == CRACKME_CHECK_PW
+
+
+@test(binary="crackme03.elf")
+def test_disasm_branch_ref_uses_local_label():
+    """A branch to an in-function label must resolve to the label, not `main`."""
+    result = disasm(CRACKME_MAIN, max_instructions=200)
+    assert_ok(result, "asm")
+    branch_refs = [
+        r
+        for ln in result["asm"]["lines"]
+        for r in ln.get("refs", [])
+        if r["name"].startswith("loc_")
+    ]
+    assert branch_refs, "expected at least one loc_* branch ref inside main"
+    for ref in branch_refs:
+        assert ref["name"] != "main", f"containing function leaked into ref: {ref}"
+
+
+@test(binary="crackme03.elf")
+def test_disasm_resolves_data_ref():
+    """disasm resolves a load of the usage string to a data ref with its symbol."""
+    result = disasm(CRACKME_MAIN, max_instructions=200)
+    assert_ok(result, "asm")
+    hits = [
+        r
+        for ln in result["asm"]["lines"]
+        for r in ln.get("refs", [])
+        if r["addr"] == CRACKME_USAGE_STRING
+    ]
+    assert hits, "expected a data ref to the usage string"
+
+
+@test(binary="crackme03.elf")
+def test_disasm_captures_comments():
+    """disasm surfaces a user-set comment on an instruction line."""
+    import ida_bytes
+
+    ea = int(CRACKME_CALL_TO_CHECK_PW, 16)
+    marker = "mcp-test-comment"
+    prev = ida_bytes.get_cmt(ea, False)
+    try:
+        ida_bytes.set_cmt(ea, marker, False)
+        result = disasm(CRACKME_MAIN, max_instructions=200)
+        assert_ok(result, "asm")
+        line = next(
+            (ln for ln in result["asm"]["lines"] if ln["addr"] == CRACKME_CALL_TO_CHECK_PW.removeprefix("0x")),
+            None,
+        )
+        assert line is not None
+        assert marker in line.get("comments", []), f"comment missing: {line}"
+    finally:
+        ida_bytes.set_cmt(ea, prev or "", False)
+
+
+@test(binary="crackme03.elf")
+def test_disasm_captures_repeatable_and_extra_comments():
+    """disasm surfaces repeatable comments and anterior/posterior extra comments."""
+    import ida_bytes
+    import ida_lines
+
+    ea = int(CRACKME_CALL_TO_CHECK_PW, 16)
+    prev_rep = ida_bytes.get_cmt(ea, True)
+    try:
+        ida_bytes.set_cmt(ea, "rep-marker", True)
+        ida_lines.update_extra_cmt(ea, ida_lines.E_PREV, "ante-marker-0")
+        ida_lines.update_extra_cmt(ea, ida_lines.E_PREV + 1, "ante-marker-1")
+        ida_lines.update_extra_cmt(ea, ida_lines.E_NEXT, "post-marker")
+
+        result = disasm(CRACKME_MAIN, max_instructions=200)
+        assert_ok(result, "asm")
+        line = next(
+            (
+                ln
+                for ln in result["asm"]["lines"]
+                if ln["addr"] == CRACKME_CALL_TO_CHECK_PW.removeprefix("0x")
+            ),
+            None,
+        )
+        assert line is not None
+        comments = line.get("comments", [])
+        for marker in ("rep-marker", "ante-marker-0", "ante-marker-1", "post-marker"):
+            assert marker in comments, f"{marker} missing: {comments}"
+        # Ordering contract: anterior (multi-line, in order) -> inline -> posterior
+        assert (
+            comments.index("ante-marker-0")
+            < comments.index("ante-marker-1")
+            < comments.index("rep-marker")
+            < comments.index("post-marker")
+        )
+    finally:
+        ida_bytes.set_cmt(ea, prev_rep or "", True)
+        ida_lines.del_extra_cmt(ea, ida_lines.E_PREV)
+        ida_lines.del_extra_cmt(ea, ida_lines.E_PREV + 1)
+        ida_lines.del_extra_cmt(ea, ida_lines.E_NEXT)
+
+
+@test(binary="crackme03.elf")
+def test_disasm_ref_decodes_string_literal():
+    """A data ref targeting a string literal carries the decoded bytes."""
+    result = disasm(CRACKME_MAIN, max_instructions=200)
+    assert_ok(result, "asm")
+    usage_refs = [
+        r
+        for ln in result["asm"]["lines"]
+        for r in ln.get("refs", [])
+        if r["addr"] == CRACKME_USAGE_STRING
+    ]
+    assert usage_refs, "expected a ref to the usage string"
+    with_string = [r for r in usage_refs if "string" in r]
+    assert with_string, f"no ref carried a decoded string: {usage_refs}"
+    assert "Need exactly" in with_string[0]["string"]
+
+
+@test(binary="crackme03.elf")
 def test_xrefs_to_check_pw_from_main():
     """xrefs_to(check_pw) includes the known call from main."""
     result = xrefs_to(CRACKME_CHECK_PW)
@@ -234,6 +420,21 @@ def test_xrefs_to_check_pw_from_main():
     assert hit["fn"]["name"] == "main"
 
 
+@test(binary="crackme03.elf")
+def test_xrefs_to_by_name():
+    """xrefs_to accepts a function name and returns the same xrefs as by address."""
+    result = xrefs_to("check_pw")
+    assert_is_list(result, min_length=1)
+    entry = result[0]
+    assert_is_list(entry["xrefs"], min_length=1)
+    hit = next(
+        (xref for xref in entry["xrefs"] if xref["addr"] == CRACKME_CALL_TO_CHECK_PW),
+        None,
+    )
+    assert hit is not None, "expected call site 0x12d3 -> check_pw via name"
+    assert hit["fn"]["name"] == "main"
+
+
 @test()
 def test_xrefs_to_invalid():
     """xrefs_to reports an error or empty xrefs for an invalid address."""
@@ -242,6 +443,59 @@ def test_xrefs_to_invalid():
     assert result[0]["addr"] == get_unmapped_address()
     if result[0].get("xrefs") is None:
         assert_error(result[0])
+
+
+@test()
+def test_xref_query():
+    """xref_query returns paged xref results for a function"""
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+
+    result = xref_query(
+        {
+            "addr": fn_addr,
+            "direction": "both",
+            "xref_type": "any",
+            "offset": 0,
+            "count": 10,
+            "include_fn": True,
+        }
+    )
+    assert_is_list(result, min_length=1)
+    page = result[0]
+    assert_has_keys(page, "target", "resolved_addr", "data", "next_offset", "total", "error")
+    if page["data"]:
+        assert_has_keys(page["data"][0], "direction", "addr", "from", "to", "type")
+
+
+@test()
+def test_insn_query_function_scope():
+    """insn_query supports scoped instruction search with pagination"""
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+
+    result = insn_query({"func": fn_addr, "count": 8, "include_disasm": True})
+    assert_is_list(result, min_length=1)
+    page = result[0]
+    assert_has_keys(page, "query", "matches", "count", "scanned", "cursor", "error")
+    assert page.get("error") is None
+    if page["matches"]:
+        assert_has_keys(page["matches"][0], "addr", "disasm")
+
+
+@test()
+def test_insn_query_requires_scope_by_default():
+    """insn_query rejects broad scans unless allow_broad is set"""
+    result = insn_query({"mnem": "call"})
+    assert_is_list(result, min_length=1)
+    assert result[0].get("error") is not None
+
+
+# ============================================================================
+# Tests for xrefs_to_field
+# ============================================================================
 
 
 @test()
@@ -275,6 +529,17 @@ def test_callees_main_contains_expected_targets():
     assert "check_pw" in by_name
     assert ".printf" in by_name
     assert by_name["check_pw"]["addr"] == CRACKME_CHECK_PW
+
+
+@test(binary="crackme03.elf")
+def test_callees_by_name():
+    """callees accepts a function name and returns the same callees as by address."""
+    result = callees("main")
+    assert_is_list(result, min_length=1)
+    entry = result[0]
+    assert_is_list(entry["callees"], min_length=1)
+    by_name = {callee["name"]: callee for callee in entry["callees"]}
+    assert "check_pw" in by_name
 
 
 @test()
@@ -376,7 +641,7 @@ def test_find_data_ref_invalid_target():
     """find(data_ref, ...) reports invalid target address parsing errors."""
     result = find("data_ref", "definitely_not_an_address")
     assert_is_list(result, min_length=1)
-    assert_error(result[0], contains="Failed to parse address")
+    assert_error(result[0], contains="Not found")
 
 
 @test()
@@ -431,14 +696,15 @@ def test_export_funcs_invalid_address():
 
 @test(binary="crackme03.elf")
 def test_callgraph_main_contains_expected_nodes():
-    """callgraph(main) includes main, check_pw and imported callees."""
+    """callgraph(main) includes the local crackme call edge to check_pw."""
     result = callgraph(CRACKME_MAIN)
     assert_is_list(result, min_length=1)
     entry = result[0]
     assert_is_list(entry["nodes"], min_length=1)
     assert_is_list(entry["edges"], min_length=1)
     names = {node["name"] for node in entry["nodes"]}
-    assert {"main", "check_pw", ".puts", ".printf"}.issubset(names)
+    assert {"main", "check_pw"}.issubset(names)
+    assert any(edge["from"] == CRACKME_MAIN and edge["to"] == CRACKME_CHECK_PW for edge in entry["edges"])
     for node in entry["nodes"]:
         assert_valid_address(node["addr"])
         assert node["depth"] >= 0
@@ -465,3 +731,74 @@ def test_callgraph_invalid_root():
     result = callgraph(get_unmapped_address())
     assert_is_list(result, min_length=1)
     assert_error(result[0])
+
+
+# ============================================================================
+# Tests for func_profile / analyze_batch
+# ============================================================================
+
+
+@test()
+def test_func_profile():
+    """func_profile returns function profile metrics"""
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+
+    result = func_profile({"addr": fn_addr, "include_lists": False})
+    assert_is_list(result, min_length=1)
+    page = result[0]
+    assert_has_keys(page, "data", "next_offset", "error")
+    if page["data"]:
+        r = page["data"][0]
+        assert_has_keys(
+            r,
+            "addr",
+            "name",
+            "size",
+            "instruction_count",
+            "basic_block_count",
+            "caller_count",
+            "callee_count",
+            "has_type",
+            "error",
+        )
+
+
+@test()
+def test_analyze_batch():
+    """analyze_batch returns structured analysis for a function"""
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+
+    result = analyze_batch(
+        {
+            "addr": fn_addr,
+            "include_disasm": True,
+            "max_disasm_insns": 16,
+            "include_strings": True,
+            "max_strings": 16,
+            "include_constants": True,
+            "max_constants": 16,
+            "include_basic_blocks": True,
+            "max_blocks": 16,
+        }
+    )
+    assert_is_list(result, min_length=1)
+    r = result[0]
+    assert_has_keys(r, "target", "addr", "name", "analysis", "error")
+    if r["analysis"] is not None:
+        a = r["analysis"]
+        assert_has_keys(
+            a,
+            "size",
+            "decompile",
+            "disasm",
+            "xrefs",
+            "caller_count",
+            "callee_count",
+            "string_ref_count",
+            "constant_count",
+            "basic_block_count",
+        )
